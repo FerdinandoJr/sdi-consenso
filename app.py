@@ -31,6 +31,9 @@ class App:
         self.unicast_sock.bind((self.node.ip, self.node.port))
         self.unicast_sock.settimeout(1.0)
 
+        # Adiciona uma trava na eleição
+        self.election_lock = threading.Lock()
+
     def start(self):
         threading.Thread(target=self._listener_multicast, daemon=True).start()
         threading.Thread(target=self._listener_unicast, daemon=True).start()
@@ -49,7 +52,33 @@ class App:
 
     # (A Fazer)
     def _election(self):
-        return
+        with self.election_lock:
+            if self.state == "election":
+                return  # já está em eleição, evita concorrência
+
+            self.state = "election"
+            print("[ELECTION] Iniciando eleição...")
+
+            all_nodes = {**self.friends, self.node.id: self.node}
+            new_leader = max(all_nodes.values(), key=lambda n: n.id)
+
+            self.leader_id = new_leader.id
+            self.node.is_leader = (self.node.id == new_leader.id)
+
+            print(f"[ELECTION] Novo líder eleito: {self.leader_id}")
+
+            # Envia aviso de novo líder
+            msg = json.dumps({
+                'type': 'new_leader',
+                'leader_id': self.leader_id,
+                'id': self.node.id,
+                'ip': self.node.ip,
+                'port': self.node.port
+            })
+            self.multicast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
+            self.state = "running"
+
+
 
     def _start_discovery(self):
         """Envia um multicast para saber quem está na rede"""
@@ -63,6 +92,7 @@ class App:
             self.multicast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
             print("[DISCOVER] Procurando nodes via multicast...")
             time.sleep(5)
+        
 
     def _start_keep_alive(self):
         """ Envia que vc está vivo a cada 5 segundos """
@@ -75,7 +105,12 @@ class App:
             })                        
             self.multicast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
             time.sleep(5)
-            print(f"[WAITING] Total de nodes: {len(self.friends) + 1}")
+            print(f"[{self.node.id}][Leader: {self.leader_id}][WAITING] Total de nodes: {len(self.friends) + 1}")
+
+            if len(self.friends) + 1 >= 3 and self.leader_id is None:
+                print("[TRIGGER] Eleição automática: ao menos 3 nós detectados")
+                self._election()
+
 
     def _listener_multicast(self):
         """Escuta respostas enviadas por multicast"""
@@ -111,6 +146,14 @@ class App:
 
                 if payload.get('type') == 'heartbeat':                    
                     self.friends[peer_id].last_seen = time.time()
+
+                if payload.get('type') == 'new_leader':
+                    self.leader_id = payload['leader_id']
+                    for f in self.friends.values():
+                        f.is_leader = (f.id == self.leader_id)
+                    self.node.is_leader = (self.node.id == self.leader_id)
+                    print(f"[LEADER UPDATE] Novo líder: {self.leader_id}")
+
 
             except socket.timeout:
                 continue
@@ -158,8 +201,17 @@ class App:
                     # remove o integrante 
                     self._remove_friend(peer_id)                    
                     # Se for o líder, dispare eleição:
-                    # if peer_id == self.leader_id:
-                    #     self._election()
+                    if peer_id == self.leader_id:
+                        print("[LEADER DOWN] O líder morreu!")
+                        self.leader_id = None  # limpa o líder
+
+                        active_nodes = len(self.friends) + 1  # incluindo a si mesmo
+                        if active_nodes >= 3:
+                            print("[ELECTION TRIGGER] Pelo menos 3 nós ativos. Iniciando nova eleição...")
+                            self._election()
+                        else:
+                            print("[ELECTION ABORTED] Menos de 3 nós ativos. Eleição não será realizada.")
+
             time.sleep(1)
 
     def _send_ack(self, peer_ip, peer_port):
