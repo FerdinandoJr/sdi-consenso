@@ -1,6 +1,7 @@
 import socket
 import struct
 import threading
+import random
 import time
 import json
 from node import Node
@@ -14,6 +15,13 @@ class App:
         self.state = "running" # running, election and consensus
         self.timeout_threshold = 10 # Limite do timeout (em segundos)
         self.stop_event = threading.Event() # responsavel por parar os loopings
+        self.current_round = 0 # Conta rounds
+        self.round_lock = threading.Lock()  # Trava de Rounds
+        self.election_lock = threading.Lock() # Trava de Eleição
+        self.last_round_time = 0 # 
+        self.rounds_enabled = False # verifica se ainda tem nós suficientes se o lider não morrer
+
+
 
         # responsavel por esperar a thread iniciar
         self._ready_multicast = threading.Event() 
@@ -31,8 +39,7 @@ class App:
         self.unicast_sock.bind((self.node.ip, self.node.port))
         self.unicast_sock.settimeout(1.0)
 
-        # Adiciona uma trava na eleição
-        self.election_lock = threading.Lock()
+        
 
     def start(self):
         threading.Thread(target=self._listener_multicast, daemon=True).start()
@@ -66,6 +73,10 @@ class App:
             self.node.is_leader = (self.node.id == new_leader.id)
 
             print(f"[ELECTION] Novo líder eleito: {self.leader_id}")
+            
+            if self.node.is_leader:
+                print("[ELECTION] Iniciando thread de rounds (líder)")
+                threading.Thread(target=self._start_rounds, daemon=True).start()
 
             # Envia aviso de novo líder
             msg = json.dumps({
@@ -77,6 +88,27 @@ class App:
             })
             self.multicast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
             self.state = "running"
+
+                
+    def _start_rounds(self):
+        self.rounds_enabled = True
+        while not self.stop_event.is_set() and self.node.is_leader:
+            with self.round_lock:
+                self.current_round += 1
+                round_number = self.current_round
+
+            rand = random.randint(1, 100)
+            print(f"[ROUND] Rodada {round_number} iniciada pelo líder {self.node.id}")
+            print(f"[ROUND {round_number}] LÍDER {self.node.id} gerou número aleatório: {rand}")
+
+            msg = json.dumps({
+                'type': 'round',
+                'round': round_number,
+                'leader_id': self.node.id
+            })
+            self.multicast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
+
+            time.sleep(15)
 
 
 
@@ -105,7 +137,7 @@ class App:
             })                        
             self.multicast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
             time.sleep(5)
-            print(f"[{self.node.id}][Leader: {self.leader_id}][WAITING] Total de nodes: {len(self.friends) + 1}")
+            print(f"[{self.node.id}][Leader: {self.leader_id}] [Lider? {self.node.is_leader}] [WAITING] Total de nodes: {len(self.friends) + 1}")
 
             if len(self.friends) + 1 >= 3 and self.leader_id is None:
                 print("[TRIGGER] Eleição automática: ao menos 3 nós detectados")
@@ -117,7 +149,7 @@ class App:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('', MCAST_PORT))
-        
+
         mreq = struct.pack('4s4s', socket.inet_aton(MCAST_GRP), socket.inet_aton(self.node.ip))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(1.0)
@@ -128,37 +160,81 @@ class App:
         while not self.stop_event.is_set():
             try:
                 data, (sender_ip, sender_port) = sock.recvfrom(BUFFER_SIZE)
-                payload = json.loads(data.decode())
-
-                # Ignora o seu multicast
-                if payload.get('id') == self.node.id: 
+                try:
+                    payload = json.loads(data.decode())
+                except json.JSONDecodeError as e:
+                    print(f"[WARN] JSON inválido recebido: {data!r} Erro: {e}")
                     continue
 
-                peer_id = payload.get('id')
-                peer_ip = payload.get('ip')
-                peer_port = payload.get('port')
-                
-                if peer_id not in self.friends :
-                    print(f"Node encontrado: {peer_id} em {peer_ip}:{peer_port}")                    
-                    self._add_friend(peer_id, peer_ip, peer_port, False)
-                    self._send_ack(peer_ip, peer_port) # envia ACK unicast diretamente ao nó
-                    
+                payload_type = payload.get('type')
 
-                if payload.get('type') == 'heartbeat':                    
-                    self.friends[peer_id].last_seen = time.time()
+                # Pacotes que exigem id/ip/port válidos
+                if payload_type in {'discover', 'heartbeat'}:
+                    peer_id = payload.get('id')
+                    peer_ip = payload.get('ip')
+                    peer_port = payload.get('port')
 
-                if payload.get('type') == 'new_leader':
+                    if peer_id is None or peer_ip is None or peer_port is None:
+                        print(f"[WARN] Pacote multicast com dados inválidos: {payload}")
+                        continue
+
+                    if peer_id == self.node.id:
+                        continue  # ignora o próprio
+
+                    if peer_id not in self.friends:
+                        print(f"Node encontrado: {peer_id} em {peer_ip}:{peer_port}")
+                        self._add_friend(peer_id, peer_ip, peer_port, False)
+                        self._send_ack(peer_ip, peer_port)
+
+                    if payload_type == 'heartbeat':
+                        self.friends[peer_id].last_seen = time.time()
+
+                elif payload_type == 'new_leader':
                     self.leader_id = payload['leader_id']
                     for f in self.friends.values():
                         f.is_leader = (f.id == self.leader_id)
+                    was_leader = self.node.is_leader
                     self.node.is_leader = (self.node.id == self.leader_id)
                     print(f"[LEADER UPDATE] Novo líder: {self.leader_id}")
 
+                    if self.node.is_leader and not was_leader:
+                        print("[LEADER UPDATE] Sou o líder agora, iniciando thread de rodadas.")
+                        threading.Thread(target=self._start_rounds, daemon=True).start()
+
+                elif payload_type == 'round':
+                    round_num = payload.get('round')
+                    leader_id = payload.get('leader_id')
+
+                    # Se a rodada recebida for maior que a atual (mensagem do futuro)
+                    if round_num > self.current_round:
+                        print(f"[WARN] Rodada FUTURA recebida! ({round_num} > {self.current_round})")
+
+                        # Se eu ainda for líder, abdico para evitar conflito
+                        if self.node.is_leader:
+                            print(f"[WARN] Eu ({self.node.id}) era líder, mas estou abdincando devido à rodada futura.")
+                            self.node.is_leader = False
+                            self.leader_id = None
+                        
+                        # Atualizo o round atual para o novo valor
+                        with self.round_lock:
+                            self.current_round = round_num
+
+                        # Atualizo o líder para o que veio na mensagem
+                        self.leader_id = leader_id
+
+                    # Se não for líder, processo a rodada normalmente
+                    if not self.node.is_leader and round_num == self.current_round:
+                        rand = random.randint(1, 100)
+                        print(f"[ROUND {round_num}] Processo {self.node.id} gerou número aleatório: {rand}")
+
+                else:
+                    print(f"[WARN] Tipo de pacote desconhecido: {payload}")
 
             except socket.timeout:
                 continue
 
         sock.close()
+
 
     def _listener_unicast(self):
         """Escuta respostas enviadas unicamente para esse nó"""
@@ -199,7 +275,14 @@ class App:
                     print(f"[TIMEOUT] Nó {peer_id} sem resposta por {self.timeout_threshold} segundos")                    
                     
                     # remove o integrante 
-                    self._remove_friend(peer_id)                    
+                    self._remove_friend(peer_id)
+
+                    if self.node.is_leader:
+                        active_nodes = len(self.friends) + 1  # inclui a si mesmo
+                        if active_nodes < 3:
+                            print("[ROUND ABORTED] Menos de 3 nós ativos. Pausando rodadas.")
+                            self.rounds_enabled = False
+
                     # Se for o líder, dispare eleição:
                     if peer_id == self.leader_id:
                         print("[LEADER DOWN] O líder morreu!")
