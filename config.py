@@ -1,0 +1,6 @@
+# config.py
+
+MCAST_GRP   = '224.0.0.2'
+MCAST_PORT  = 5007
+ACK_PORT    = 5008
+BUFFER_SIZE = 1024
